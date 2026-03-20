@@ -20,7 +20,7 @@ def _():
     import matplotlib.pyplot as plt
     from typing import Callable, Union, Literal
     from scipy.stats import entropy
-    import desbordante as db
+    #import desbordante as db
     import itertools
     from tqdm import tqdm #usually this library slow down loops
     import plotly.graph_objects as go
@@ -151,6 +151,117 @@ def _(DATASETS, defaultdict, np, pd):
         return df
 
 
+    def compute_plan_tables(nodes: dict, links: list):
+        """
+        Returns (plan_progress, action_conversion).
+
+        plan_progress:     industry | plan_type | n_plans | n_topics
+          → Chart 5: which plan types does each industry generate?
+
+        action_conversion: industry | total_plans | action_plans | action_share
+          → Chart 7: what share of plans actually reach "Take Action"?
+
+        Mirrors the reference notebook (vast_mc2_q2_dashboard.py) but uses the
+        dict/list graph representation already in use here.
+        """
+        _TOPIC_IND = {
+            "expanding_tourist_wharf": "Tourism",
+            "marine_life_deck":        "Tourism",
+            "seafood_festival":        "Tourism",
+            "heritage_walking_tour":   "Tourism",
+            "waterfront_market":       "Tourism",
+            "deep_fishing_dock":       "Fishing",
+            "new_crane_lomark":        "Fishing",
+            "fish_vacuum":             "Fishing",
+            "low_volume_crane":        "Fishing",
+            "affordable_housing":      "Fishing",
+            "statue_john_smoth":       "Neutral",
+            "renaming_park_himark":    "Neutral",
+            "name_harbor_area":        "Neutral",
+            "name_inspection_office":  "Neutral",
+            "concert":                 "Neutral",
+        }
+        _PT_MAP = {
+            "discussion": "Discuss",    "discuss": "Discuss",
+            "feedback":   "Feedback",   "report":  "Report",
+            "proposal":   "Proposal",   "presentation": "Presentation",
+            "travel":     "Travel",
+            "take action": "Take Action", "action": "Take Action",
+        }
+        _EMPTY_PP = pd.DataFrame(columns=["industry", "plan_type", "n_plans", "n_topics"])
+        _EMPTY_AC = pd.DataFrame(columns=["industry", "total_plans", "action_plans", "action_share"])
+
+        # ── pass 1: build topic/plan lookup tables ────────────────────────────
+        disc_topic = {}             # disc_id  → topic_id
+        plan_topic = {}             # plan_id  → topic_id (via direct role="plan" link)
+        disc_plans = defaultdict(list)   # disc_id  → [plan_id, ...]
+
+        for l in links:
+            role = l.get("role")
+            src, tgt = l["source"], l["target"]
+            sn = nodes.get(src, {})
+            tn = nodes.get(tgt, {})
+
+            if role == "about":
+                if sn.get("type") == "discussion" and tn.get("type") == "topic":
+                    disc_topic[src] = tgt
+                elif sn.get("type") == "discussion" and tn.get("type") == "plan":
+                    disc_plans[src].append(tgt)
+            elif role == "plan":
+                if sn.get("type") == "plan" and tn.get("type") == "topic":
+                    plan_topic[src] = tgt
+
+        # Propagate discussion→topic down to plans that lack a direct topic link
+        for disc_id, pids in disc_plans.items():
+            tid = disc_topic.get(disc_id)
+            if tid:
+                for pid in pids:
+                    if pid not in plan_topic:
+                        plan_topic[pid] = tid
+
+        # ── pass 2: one row per plan node ────────────────────────────────────
+        rows = []
+        for nid, n in nodes.items():
+            if n.get("type") != "plan":
+                continue
+            tid = plan_topic.get(nid)
+            if tid is None:
+                continue
+            tnode = nodes.get(tid, {})
+            short    = tnode.get("short_topic", str(tid))
+            industry = _TOPIC_IND.get(short, "Neutral")
+
+            pt_raw  = n.get("plan_type", "") or ""
+            pt_norm = _PT_MAP.get(pt_raw.strip().lower(),
+                                  pt_raw.strip().title() if pt_raw.strip() else "Unknown")
+            rows.append({"plan_id": nid, "plan_type": pt_norm,
+                         "topic_id": tid, "industry": industry})
+
+        if not rows:
+            return _EMPTY_PP, _EMPTY_AC
+
+        df = pd.DataFrame(rows).drop_duplicates("plan_id")
+
+        plan_progress = (
+            df.groupby(["industry", "plan_type"])
+            .agg(n_plans=("plan_id", "nunique"), n_topics=("topic_id", "nunique"))
+            .reset_index()
+        )
+
+        df["is_action"] = df["plan_type"] == "Take Action"
+        action_conversion = (
+            df.groupby("industry")
+            .agg(total_plans=("plan_id", "nunique"), action_plans=("is_action", "sum"))
+            .reset_index()
+        )
+        action_conversion["action_share"] = (
+            action_conversion["action_plans"]
+            / action_conversion["total_plans"].replace(0, pd.NA)
+        ).fillna(0).round(3)
+
+        return plan_progress, action_conversion
+
+
     # ── Cell 1: add to existing controls ─────────────────────────────────────────
     ALL_MEETINGS = [f"Meeting_{i}" for i in range(1, 17)]  # full range
 
@@ -159,10 +270,11 @@ def _(DATASETS, defaultdict, np, pd):
     # ─────────────────────────────────────────────────────────────────────────────
     #  PRE-COMPUTE  (use dict-based DATASETS, not DATASETS_DF)
     # ─────────────────────────────────────────────────────────────────────────────
-    SENT  = {k: compute_sentiment(*v) for k, v in DATASETS.items()}
-    ZONES = {k: compute_zones(*v)     for k, v in DATASETS.items()}
-    ZONES_PCT = {k: compute_zone_pct(*v) for k, v in DATASETS.items()}
-    return SENT, ZONES, compute_sentiment, compute_zones
+    SENT        = {k: compute_sentiment(*v)   for k, v in DATASETS.items()}
+    ZONES       = {k: compute_zones(*v)       for k, v in DATASETS.items()}
+    ZONES_PCT   = {k: compute_zone_pct(*v)    for k, v in DATASETS.items()}
+    PLAN_TABLES = {k: compute_plan_tables(*v) for k, v in DATASETS.items()}
+    return PLAN_TABLES, SENT, ZONES, compute_sentiment, compute_zones
 
 
 @app.cell
@@ -269,6 +381,128 @@ def _(SENT, go, pd):
         )
         return fig
     return fig_heatmap, fig_sentiment_bars
+
+
+@app.cell
+def _(go, pd):
+    # ─────────────────────────────────────────────────────────────────────────────
+    #  ENACTIVE BIAS FIGURES 
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    _PT_ORDER = [
+        "Discuss", "Feedback", "Report",
+        "Presentation", "Proposal", "Travel", "Take Action", "Unknown",
+    ]
+    _PT_COLORS = {
+        "Discuss":      "#94a3b8",
+        "Feedback":     "#a78bfa",
+        "Report":       "#60a5fa",
+        "Presentation": "#34d399",
+        "Proposal":     "#fbbf24",
+        "Travel":       "#f97316",
+        "Take Action":  "#4ade80",
+        "Unknown":      "#e2e8f0",
+    }
+    _IND_COLORS = {"Tourism": "#0ea5e9", "Fishing": "#f97316", "Neutral": "#94a3b8"}
+
+    def fig_plan_funnel(plan_progress: pd.DataFrame, title: str = "") -> go.Figure:
+        """
+        Chart 5 equivalent: stacked bar of plan types per industry.
+        Shows which industries generate which kinds of plans — discussion only,
+        proposals, or actual 'Take Action' decisions.
+        """
+        if plan_progress.empty:
+            return go.Figure()
+
+        industries = sorted(plan_progress["industry"].unique())
+
+        fig = go.Figure()
+        for pt in _PT_ORDER:
+            sub = plan_progress[plan_progress["plan_type"] == pt]
+            if sub.empty:
+                continue
+            vals  = [int(sub.loc[sub["industry"] == ind, "n_plans" ].values[0])
+                     if ind in sub["industry"].values else 0 for ind in industries]
+            tops  = [int(sub.loc[sub["industry"] == ind, "n_topics"].values[0])
+                     if ind in sub["industry"].values else 0 for ind in industries]
+            fig.add_trace(go.Bar(
+                name=pt,
+                x=industries, y=vals,
+                marker_color=_PT_COLORS.get(pt, "#94a3b8"),
+                opacity=0.9,
+                customdata=tops,
+                hovertemplate=(
+                    f"<b>%{{x}}</b><br>plan type: {pt}<br>"
+                    "plans: %{y}<br>topics: %{customdata}<extra></extra>"
+                ),
+            ))
+
+        fig.update_layout(
+            barmode="stack",
+            title=dict(text=f"Plan progression by industry — {title}",
+                       font=dict(size=13, color="black"), x=0.01),
+            height=320,
+            margin=dict(l=10, r=10, t=44, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="black"),
+            legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="black")),
+            xaxis=dict(tickfont=dict(color="black")),
+            yaxis=dict(
+                zeroline=False, gridcolor="#dddddd",
+                title=dict(text="number of plans", font=dict(size=10, color="black")),
+                tickfont=dict(color="black"),
+            ),
+        )
+        return fig
+
+    def fig_action_conversion(action_conversion: pd.DataFrame, title: str = "") -> go.Figure:
+        """
+        Chart 7 equivalent: % of plans reaching 'Take Action' per industry.
+        This is the clearest single signal of enactive bias — which industry's
+        discussions actually convert into committed action?
+        """
+        if action_conversion.empty:
+            return go.Figure()
+
+        df     = action_conversion.sort_values("action_share", ascending=False)
+        colors = [_IND_COLORS.get(ind, "#94a3b8") for ind in df["industry"]]
+        y_max  = max(float(df["action_share"].max()) * 110, 10)
+
+        fig = go.Figure(go.Bar(
+            x=df["industry"],
+            y=(df["action_share"] * 100).round(1),
+            marker_color=colors,
+            opacity=0.88,
+            customdata=df[["action_plans", "total_plans"]].values,
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "action share: %{y:.1f}%<br>"
+                "Take Action plans: %{customdata[0]:.0f} / %{customdata[1]:.0f} total"
+                "<extra></extra>"
+            ),
+        ))
+
+        fig.update_layout(
+            title=dict(text=f"Action conversion rate by industry — {title}",
+                       font=dict(size=13, color="black"), x=0.01),
+            height=300,
+            margin=dict(l=10, r=10, t=44, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="black"),
+            xaxis=dict(tickfont=dict(color="black")),
+            yaxis=dict(
+                range=[0, y_max],
+                zeroline=False, gridcolor="#dddddd",
+                title=dict(text="% of plans reaching Take Action",
+                           font=dict(size=10, color="black")),
+                ticksuffix="%",
+                tickfont=dict(color="black"),
+            ),
+        )
+        return fig
+    return fig_action_conversion, fig_plan_funnel
 
 
 @app.cell
@@ -473,7 +707,7 @@ def _(chart_type, dataset_selector, go, mo, pd, share_type):
         Error bars show std of individual sentiment observations per person.
         """
         # nodes, links = DATASETS[title]
-    
+
         fishing_inds = ["large vessel", "small vessel"]
         # ── raw rows (needed for std) ─────────────────────────────────────────────
         rows = []
@@ -1583,21 +1817,25 @@ def _(adj_scale, chart_type, dataset_selector, meeting_range, mo, share_type):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(
     DATASETS,
+    PLAN_TABLES,
     adj_scale,
     chart_type,
     compute_sentiment,
     compute_zones,
     dataset_selector,
+    fig_action_conversion,
     fig_bias_score,
     fig_heatmap,
+    fig_plan_funnel,
     fig_sentiment_bars,
     fig_sentiment_scatter,
     fig_zone_bars,
     meeting_range,
     mo,
+    pd,
     share_type,
 ):
     # ── Cell 2: filtered data (reacts to dataset + meeting range) ────────────────
@@ -1649,17 +1887,26 @@ def _(
                                 use_share=_share,
                                 fix_scale=_adj)
 
+    # ── enactive bias figures ────────────────────────────────────────────────────
+    _plan_progress, _action_conv = PLAN_TABLES.get(
+        _ds, (pd.DataFrame(), pd.DataFrame())
+    )
+    _fig_funnel  = fig_plan_funnel(_plan_progress, _ds)
+    _fig_actconv = fig_action_conversion(_action_conv, _ds)
+
     # ── info strip ────────────────────────────────────────────────────────────────
     _n_mem   = _sent_filtered["person"].nunique()  if not _sent_filtered.empty  else 0
     _n_rec   = int(_sent_filtered["n"].sum())      if not _sent_filtered.empty  else 0
     _n_trips = int(_zones_filtered["trips"].sum()) if not _zones_filtered.empty else 0
+    _n_plans = int(_plan_progress["n_plans"].sum()) if not _plan_progress.empty else 0
 
     _info = mo.md(
         f"Dataset **{_ds}** · "
         f"Meetings **{_m_from} → {_m_to}** · "
         f"Members: **{_n_mem}** · "
         f"Records: **{_n_rec}** · "
-        f"Trip waypoints: **{_n_trips}**"
+        f"Trip waypoints: **{_n_trips}** · "
+        f"Plans tracked: **{_n_plans}**"
     )
 
     # ── layout ────────────────────────────────────────────────────────────────────
@@ -1670,18 +1917,24 @@ def _(
             "Select a **dataset** to explore how FILAH and TROUT recorded member activity. "
             "Toggle between **Heatmap / Bar chart** for sentiment, "
             "**% share / raw counts** for travel zones, "
-            "and **fix / float** the y-axis scale for cross-dataset comparison."
+            "and **fix / float** the y-axis scale for cross-dataset comparison.\n\n"
+            "The bottom row adds a second dimension of bias: **what plans were committed to action**, "
+            "not just what members said. Chart 5 shows plan type breakdown per industry; "
+            "Chart 7 shows what share actually reached 'Take Action' — the clearest single enactive bias signal."
         ),
         mo.callout(_info, kind="neutral"),
         mo.hstack([dataset_selector, chart_type, share_type, adj_scale, meeting_range],
                   gap=0.5, widths="equal"),
+        mo.md("### Expressive bias — what members said"),
         mo.hstack([mo.ui.plotly(_fig_sent),  mo.ui.plotly(_fig_scat)],  widths="equal", gap=0.5),
         mo.hstack([mo.ui.plotly(_fig_bias),  mo.ui.plotly(_fig_zones)], widths="equal", gap=0.5),
+        mo.md("### Enactive bias — what plans reached action"),
+        mo.hstack([mo.ui.plotly(_fig_funnel), mo.ui.plotly(_fig_actconv)], widths="equal", gap=0.5),
     ], gap=0.5)
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(ALL_PERSONS, mo):
     # ── widgets for advanced viz ─────────────────────────────────────────────────
     ds_adv = mo.ui.dropdown(
@@ -1698,7 +1951,7 @@ def _(ALL_PERSONS, mo):
     return ds_adv, person_map
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(
     DATASETS,
     ds_adv,
@@ -1738,6 +1991,11 @@ def _(
         mo.md("### Trip waypoints map"),
         mo.ui.plotly(fig_trip_map(_nodes, _links, _ds, selected_person=person_map.value)),
     ], gap=0.5)
+    return
+
+
+@app.cell
+def _():
     return
 
 
