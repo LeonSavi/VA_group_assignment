@@ -1,3 +1,8 @@
 eda_1_3.py
 eda_marimo.py
 plotly_dash.py
+/__marimo__/
+/__pycache__/
+/.vscode/
+myeasylog.log
+/__marimo__/session/
